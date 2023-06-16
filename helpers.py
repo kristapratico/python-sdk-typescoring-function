@@ -3,29 +3,29 @@
 # Licensed under the MIT License. See License.txt in the project root for license information.
 # --------------------------------------------------------------------------------------------
 
-import os
+import json
 import datetime
-import azure.functions as func
 import logging
+import pandas as pd
 import requests
 import subprocess
-import json
 import sys
-import pandas as pd
-from typing import Any
 from io import StringIO
 from packaging.version import parse
+from typing import Any
 from ci_tools.environment_exclusions import (
-    PYRIGHT_OPT_OUT,
-    MYPY_OPT_OUT,
-    TYPE_CHECK_SAMPLES_OPT_OUT,
-    VERIFYTYPES_OPT_OUT,
     IGNORE_PACKAGES,
     FILTER_EXCLUSIONS,
     IGNORE_FILTER,
 )
-from azure.data.tables import TableClient
-from azure.core.exceptions import HttpResponseError
+
+
+class TypingCheck:
+    mypy: bool = True
+    pyright: bool = True
+    type_check_samples: bool = True
+    verifytypes: bool = True
+
 
 additional_ignores = [
     "adal",
@@ -61,12 +61,14 @@ additional_ignores = [
     "azure-opentelemetry-exporter-azuremonitor",
     "azure-iot-hub",
     "uamqp",
+    "azureml-fsspec",
+    "mltable",
+    "apiview-stub-generator",
+    "azure-pylint-guidelines-checker",
 ]
 IGNORE_PACKAGES.extend(additional_ignores)
 
 logging.getLogger().setLevel(logging.INFO)
-
-app = func.FunctionApp()
 
 
 def is_ignored_package(package_name: str) -> bool:
@@ -113,9 +115,12 @@ def get_module(package: str) -> str:
         capture_output=True,
     )
     resp = response.stdout.decode("utf-8")
-    substring = resp[resp.find("Files:"):resp.find("__init__.py")]
-    module = substring[substring.find("azure"):]
-    module = module.replace("/", ".")
+    lines = resp.splitlines()
+    for line in lines:
+        if line.find("__init__.py") != -1:
+            substring = line[line.find("azure"):line.find("__init__.py")]
+            break
+    module = substring.replace("/", ".")
     module = module.replace("\\", ".")
     return module[:-1]
 
@@ -126,7 +131,7 @@ def install(packages: list[str]) -> None:
     # hacky, but we install pyright here
     # mismatch between python found by sys.executable
     # and python ran in the function
-    packages.append("pyright==1.1.274")
+    packages.append("pyright==1.1.287")
     commands = [
         sys.executable,
         "-m",
@@ -138,21 +143,75 @@ def install(packages: list[str]) -> None:
     subprocess.check_call(commands)
 
 
-@app.function_name(name="typescoretimer")
-@app.schedule(schedule="0 13 15 * *", arg_name="score", run_on_startup=True,
-              use_monitor=False)
-def test_function(score: func.TimerRequest) -> None:
-    logging.info('Python HTTP trigger function processed a request.')
+def uninstall_deps(deps: list[str]) -> None:
+    commands = [
+        sys.executable,
+        "-m",
+        "pip",
+        "uninstall",
+        "-y"
+    ]
 
+    commands.extend(deps)
+    subprocess.check_call(commands)
+
+
+def is_check_enabled(package_path: str) -> TypingCheck:
+    toml_path = f"https://raw.githubusercontent.com/Azure/azure-sdk-for-python/main/sdk/{package_path}/pyproject.toml"
+    response = requests.get(toml_path)
+    if response.status_code == 404:
+        # no pyproject.toml file -- library runs all checks
+        return TypingCheck()
+
+    is_enabled = TypingCheck()
+    toml = response.text.split("\n")
+    for line in toml:
+        line = line.lower()
+        if line.find("mypy") != -1 and line.find("false") != -1:
+            is_enabled.mypy = False
+        if line.find("pyright") != -1 and line.find("false") != -1:
+            is_enabled.pyright = False
+        if line.find("type_check_samples") != -1 and line.find("false") != -1:
+            is_enabled.type_check_samples = False
+        if line.find("verifytypes") != -1 and line.find("false") != -1:
+            is_enabled.verifytypes = False
+    return is_enabled
+
+
+def score_package(package: str, packages_to_score: dict[str, Any], entities: tuple[str, dict[str, Any]]) -> None:
+    module = get_module(package)
+    try:
+        logging.info(f"Running verifytypes on {package}")
+        commands = [sys.executable, "-m", "pyright", "--verifytypes", module, "--ignoreexternal", "--outputjson"]
+        response = subprocess.run(
+            commands,
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        if e.returncode != 1:
+            logging.info(
+                f"Running verifytypes for {package} failed: {e.stderr}"
+            )
+        else:
+            report = json.loads(e.output)
+    else:
+        report = json.loads(response.stdout)  # package scores 100%
+    pytyped_present = False if report["typeCompleteness"].get("pyTypedPath", None) is None else True
+    packages_to_score[package].update({"PyTyped": pytyped_present})
+    packages_to_score[package].update({"Score": round(report["typeCompleteness"]["completenessScore"] * 100, 1)})
+    add_entity(package, packages_to_score, entities)
+
+
+def get_packages_to_score() -> dict[str, Any]:
     today = datetime.datetime.today()
-    client = TableClient.from_connection_string(os.getenv("AzureWebJobsStorage"), table_name="PythonSDKTypeScore")
+    # today = datetime.datetime(2023, 6, 15, 8, 18, 32, 486215)
     response = requests.get("https://raw.githubusercontent.com/Azure/azure-sdk/main/_data/releases/latest/python-packages.csv")
-    fields = ["Package", "VersionGA", "VersionPreview"]
+    fields = ["Package", "VersionGA", "VersionPreview", "RepoPath"]
     df = pd.read_csv(StringIO(response.text), sep=",", usecols=fields)
     df = df.reset_index()
 
     packages_to_score = {}
-    install_packages = []
     for index, row in df.iterrows():
         package_name = row["Package"]
         # float represents NaN in csv
@@ -164,52 +223,11 @@ def test_function(score: func.TimerRequest) -> None:
             latest_version = row["VersionGA"] if not isinstance(row["VersionGA"], float) else row["VersionPreview"]
 
         packages_to_score[package_name] = {"LatestVersion": latest_version}
-        packages_to_score[package_name].update({"Pyright": package_name not in PYRIGHT_OPT_OUT})
-        packages_to_score[package_name].update({"Mypy": package_name not in MYPY_OPT_OUT})
-        packages_to_score[package_name].update({"Samples": package_name not in TYPE_CHECK_SAMPLES_OPT_OUT})
-        packages_to_score[package_name].update({"Verifytypes": package_name not in VERIFYTYPES_OPT_OUT})
+        package_path = f"{row['RepoPath']}/{row['Package']}"
+        is_enabled = is_check_enabled(package_path)
+        packages_to_score[package_name].update({"Pyright": is_enabled.pyright})
+        packages_to_score[package_name].update({"Mypy": is_enabled.mypy})
+        packages_to_score[package_name].update({"Samples": is_enabled.type_check_samples})
+        packages_to_score[package_name].update({"Verifytypes": is_enabled.verifytypes})
         packages_to_score[package_name].update({"Date": today})
-        try:
-            # if the package didn't have a release, take the old score, don't bother running verifytypes
-            entity = client.get_entity(partition_key=get_last_month(today), row_key=package_name)
-            if entity["LatestVersion"] == packages_to_score[package_name]["LatestVersion"]:
-                packages_to_score[package_name].update({"Score": entity["Score"]})
-                packages_to_score[package_name].update({"PyTyped": entity["PyTyped"]})
-                continue
-        except HttpResponseError:
-            pass
-
-        install_packages.append(f"{package_name}=={latest_version}")
-
-    install(install_packages)
-
-    entities = []
-    for package, details in packages_to_score.items():
-        if details.get("Score", None) is not None:
-            add_entity(package, packages_to_score, entities)
-            continue
-
-        module = get_module(package)
-        try:
-            logging.info(f"Running verifytypes on {package}")
-            commands = [sys.executable, "-m", "pyright", "--verifytypes", module, "--ignoreexternal", "--outputjson"]
-            response = subprocess.run(
-                commands,
-                check=True,
-                capture_output=True,
-            )
-        except subprocess.CalledProcessError as e:
-            if e.returncode != 1:
-                logging.info(
-                    f"Running verifytypes for {package} failed: {e.stderr}"
-                )
-            else:
-                report = json.loads(e.output)
-        else:
-            report = json.loads(response.stdout)  # package scores 100%
-        pytyped_present = False if report["typeCompleteness"].get("pyTypedPath", None) is None else True
-        packages_to_score[package].update({"PyTyped": pytyped_present})
-        packages_to_score[package].update({"Score": round(report["typeCompleteness"]["completenessScore"] * 100, 1)})
-        add_entity(package, packages_to_score, entities)
-
-    client.submit_transaction(entities)
+    return packages_to_score

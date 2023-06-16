@@ -2,6 +2,6 @@ azure-functions==1.12.0
 requests==2.28.1
 pandas==1.5.2
 git+https://github.com/Azure/azure-sdk-for-python#subdirectory=tools/azure-sdk-tools&egg=azure-sdk-tools
-pyright==1.1.274
-azure-data-tables==12.4.1
-azure-core==1.26.1
+pyright==1.1.287
+azure-data-tables
+azure-core
